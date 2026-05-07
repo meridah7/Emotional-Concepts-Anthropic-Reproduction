@@ -42,13 +42,16 @@ LAYERS = [10, 20, 30, 36]
 METHODS = ["methodA_v2style", "methodB_isolation", "methodC_incontext", "methodD_contrast"]
 
 
-def get_lm_head_weight(model_path: Path) -> np.ndarray:
-    """Load only lm_head.weight from safetensors. Returns (vocab, hidden) float32."""
+def get_lm_head_weight(model_path: Path, device: str = "cuda") -> torch.Tensor:
+    """Load only lm_head.weight from safetensors directly to `device` in its native dtype.
+
+    Qwen3-Next has vocab=248,320 — the bf16 weight is ~2.5GB and a fp32 numpy
+    copy would push past container memory limits. Keep it on GPU in bf16.
+    """
     from safetensors import safe_open
 
     model_path = Path(model_path)
 
-    # Try sharded safetensors index first
     index_path = model_path / "model.safetensors.index.json"
     if index_path.exists():
         index = json.loads(index_path.read_text())
@@ -61,23 +64,21 @@ def get_lm_head_weight(model_path: Path) -> np.ndarray:
             )
         key = candidates[0]
         shard_file = model_path / weight_map[key]
-        print(f"  loading {key} from {shard_file.name}")
-        with safe_open(shard_file, framework="pt") as f:
+        print(f"  loading {key} from {shard_file.name} -> {device}")
+        with safe_open(shard_file, framework="pt", device=device) as f:
             W = f.get_tensor(key)
     else:
-        # single-file safetensors
         single = model_path / "model.safetensors"
         if not single.exists():
             raise RuntimeError(f"No safetensors found in {model_path}")
-        print(f"  loading lm_head.weight from {single.name}")
-        with safe_open(single, framework="pt") as f:
+        print(f"  loading lm_head.weight from {single.name} -> {device}")
+        with safe_open(single, framework="pt", device=device) as f:
             keys = list(f.keys())
             candidates = [k for k in keys if k.endswith("lm_head.weight")]
             if not candidates:
                 raise RuntimeError(f"lm_head.weight not found. Sample keys: {keys[:5]}")
             W = f.get_tensor(candidates[0])
-
-    return W.to(torch.float32).cpu().numpy()
+    return W
 
 
 def get_tokenizer(model_path: Path):
@@ -85,12 +86,15 @@ def get_tokenizer(model_path: Path):
     return AutoTokenizer.from_pretrained(str(model_path), use_fast=False, trust_remote_code=True)
 
 
-def logit_lens_top_k(W: np.ndarray, vec: np.ndarray, top_k: int):
-    """Project vec through unembedding; return top_k up and down indices + logit values."""
-    logits = W @ vec  # (vocab,)
-    up = np.argsort(-logits)[:top_k]
-    down = np.argsort(logits)[:top_k]
-    return up, down, logits
+def logit_lens_top_k(W: torch.Tensor, vec: np.ndarray, top_k: int):
+    """W is (vocab, hidden) on GPU. Returns (up_idx, down_idx, top_up_logits, top_down_logits)
+    as small CPU arrays — never materializes the full (vocab,) logits on CPU."""
+    v = torch.from_numpy(vec.astype(np.float32)).to(dtype=W.dtype, device=W.device)
+    logits = W @ v  # (vocab,) on GPU in W.dtype
+    up_vals, up_idx = torch.topk(logits, top_k, largest=True)
+    down_vals, down_idx = torch.topk(logits, top_k, largest=False)
+    return (up_idx.cpu().numpy(), down_idx.cpu().numpy(),
+            up_vals.float().cpu().numpy(), down_vals.float().cpu().numpy())
 
 
 def run_one(W, tok, vec_path: Path, top_k: int) -> dict:
@@ -98,17 +102,17 @@ def run_one(W, tok, vec_path: Path, top_k: int) -> dict:
     data = dict(np.load(vec_path))
     out = {}
     for concept, v in data.items():
-        up_idx, down_idx, logits = logit_lens_top_k(W, v.astype(np.float32), top_k)
+        up_idx, down_idx, up_vals, down_vals = logit_lens_top_k(W, v, top_k)
         out[concept] = {
             "top_up": [
-                {"id": int(i), "logit": round(float(logits[i]), 4),
+                {"id": int(i), "logit": round(float(lv), 4),
                  "tok": tok.decode([int(i)])}
-                for i in up_idx
+                for i, lv in zip(up_idx, up_vals)
             ],
             "top_down": [
-                {"id": int(i), "logit": round(float(logits[i]), 4),
+                {"id": int(i), "logit": round(float(lv), 4),
                  "tok": tok.decode([int(i)])}
-                for i in down_idx
+                for i, lv in zip(down_idx, down_vals)
             ],
         }
     return out
@@ -147,9 +151,10 @@ def main():
         methods = [args.method] if args.method else METHODS
         layers = [args.layer] if args.layer is not None else LAYERS
 
-    print(f"loading lm_head from {args.model_path}")
-    W = get_lm_head_weight(Path(args.model_path))
-    print(f"  lm_head shape: {W.shape}, dtype: {W.dtype}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"loading lm_head from {args.model_path} (device={device})")
+    W = get_lm_head_weight(Path(args.model_path), device=device)
+    print(f"  lm_head shape: {tuple(W.shape)}, dtype: {W.dtype}, device: {W.device}")
 
     print(f"loading tokenizer ...")
     tok = get_tokenizer(Path(args.model_path))
